@@ -20,6 +20,7 @@ chmod 700 "$LIB" "$CONFIG" "$CONFIG/profiles"
 
 install -m 700 "$ROOT/bin/claude-account" "$BIN/claude-account"
 install -m 700 "$ROOT/bin/claude-account-autoswitch" "$BIN/claude-account-autoswitch"
+install -m 700 "$ROOT/bin/claude-account-regime" "$BIN/claude-account-regime"
 install -m 700 "$ROOT/bin/claude" "$BIN/claude"
 install -m 600 "$ROOT/lib/shell-init.zsh" "$LIB/shell-init.zsh"
 
@@ -28,7 +29,7 @@ install -m 600 "$ROOT/lib/shell-init.zsh" "$LIB/shell-init.zsh"
 # the active profile up on their own; nothing running is ever touched.
 rm -f "$LIB/restart-orca.sh"
 
-echo "Installed: $BIN/claude-account, $BIN/claude-account-autoswitch, $BIN/claude (wrapper)."
+echo "Installed: $BIN/claude-account, $BIN/claude-account-regime, $BIN/claude-account-autoswitch, $BIN/claude (wrapper)."
 echo
 echo "Shell integration: if your shell already defines a claude() function (claude-stable"
 echo "setups), route it through the profile: CLAUDE_NATIVE_BIN=\"\$bin\" \"\$HOME/bin/claude-account\" exec ..."
