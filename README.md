@@ -92,9 +92,9 @@ claude-account use personal
 ```
 
 > [!NOTE]
-> `use` restarts [Orca](https://orca.dev) (if installed) so live processes switch too; pass
-> `--no-restart` to skip. New shells always pick up the active profile; already-open sessions
-> keep the previous account until restarted.
+> `use` never kills anything. New `claude` processes pick the active profile up on their own;
+> sessions already running keep the account they started with (the token rides in their
+> environment from birth). Pass `--stop-daemon` if you also want the Claude daemon restarted.
 
 ## Commands
 
@@ -107,6 +107,87 @@ claude-account use personal
 | 🩺 | `doctor` | check every auth layer for divergence |
 | 📊 | `status` | active profile + fingerprints (never the secrets) |
 | 🧪 | `probe` | authenticate and run a minimal inference |
+| 📈 | `measure [name...]` | 5h and 7d rate-limit state per profile, read from response headers |
+| 🚦 | `regime [--json]` | one word saying what the quota allows right now |
+| ▶️ | `exec [args...]` | run the native binary under the active profile (what the wrapper does) |
+
+## Rate limits, automatic switching and the quota regime
+
+Three pieces on top of profile switching, all shell + `jq`, no new dependency.
+
+### `measure`
+
+Sends a one-token request to the API with each profile's token and reads the
+`anthropic-ratelimit-unified-*` response headers: utilization and reset time of the 5-hour and
+7-day windows, plus whether the account is paying overage. Prints fingerprints only, never a token.
+A native (`/login`) profile has no setup-token to measure with; give it one from the same account:
+
+```bash
+claude-account add-oauth personal-measure --measure-for personal
+```
+
+### `claude-account-autoswitch`
+
+A job for launchd or cron, every 5 minutes. It measures the two profiles named in
+`~/.config/claude-account/policy.json`, moves the active profile to `fallback` when `preferred`
+reaches the exhaustion thresholds, and returns when `preferred` has room again (hysteresis, a
+minimum interval between switches and a daily cap). It also writes `measure.json` with the last
+24 samples per profile, so a status line or any other reader consumes a file instead of calling
+the API.
+
+```json
+{
+  "preferred": "work",
+  "fallback": "personal",
+  "exhausted_at": {"five_hour": 0.95, "seven_day": 0.97},
+  "return_below": {"five_hour": 0.70, "seven_day": 0.90},
+  "min_switch_interval_min": 10,
+  "max_switches_per_day": 12
+}
+```
+
+Kill switch: `touch ~/.config/claude-account/autoswitch.off`. Log: `autoswitch.log`. A profile
+outside the policy that you activated by hand is never overridden. Try it with `--dry-run` first.
+A LaunchAgent that runs it every 5 minutes:
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>local.claude-account.autoswitch</string>
+  <key>ProgramArguments</key><array><string>/Users/YOU/bin/claude-account-autoswitch</string></array>
+  <key>StartInterval</key><integer>300</integer>
+  <key>RunAtLoad</key><true/>
+</dict></plist>
+```
+
+Save it as `~/Library/LaunchAgents/local.claude-account.autoswitch.plist` and load it with
+`launchctl bootstrap gui/$(id -u) <path>`.
+
+### `regime`
+
+One word that says what the quota allows right now, projected from the average pace of each
+window of the account **this session** actually uses (a switch never moves a running session):
+
+| Regime | Meaning |
+|---|---|
+| `livre` | reserve at reset is comfortable, nothing to do |
+| `atencao` | on pace to land close to the limit, heads up only |
+| `economia` | at this pace a window empties before it resets; heavy work is downgraded |
+| `pouso` | would be `economia`, but the 5h reset is close and the recent pace fits under 100% |
+| `trava` | both accounts are out (rejected or paying overage), measured as such |
+
+A change needs two consecutive measurements, `economia` holds 15 minutes, `trava` is immediate both
+ways because it is a measured fact, and a measurement older than 15 minutes (or a dead probe) never
+locks anything. Override with an expiry: `regime livre --por 30m`, `regime economia --por 1h`,
+`regime auto`. Under `economia` or `trava`, `exec` (and therefore the `claude` wrapper) opens the
+new session with `--effort medium` unless you pass `--effort` yourself. Hooks and status lines read
+`regime --json` (about 30 ms, no network). Tunables live in `policy.json` under `"regime"`.
+
+Why a pace projection instead of a plain "usage above N%" rule: a threshold reacts late. On the
+two mornings in a week of real transcripts where a 5h window went past 100%, an 80% threshold
+warned 20 and 75 minutes before the crossing; the projection warned about 3 hours before, with 35
+minutes of unnecessary braking in the whole week. Offline scenario tests: `tests/regime-scenarios.sh`.
 
 ## Troubleshooting
 
@@ -119,11 +200,11 @@ If it happens anyway, `doctor` catches it:
 
 ```
 [FAIL] launchctl diverges from the active profile
-[FAIL] a stale native login is still active (it shadows the setup-token)
 ```
 
-The fix is one command, no reboot: `claude-account use <any-profile>`. The `/login` credential is
-not lost; it is archived in the Keychain as the `primary` profile before the slot is cleared.
+The fix is one command, no reboot: `claude-account use <any-profile>`. A native login found in the
+live slot is never deleted: `CLAUDE_CODE_OAUTH_TOKEN` wins over it, and running native sessions keep
+refreshing their own token. Run `claude-account import-native <name>` if you want it as a profile.
 
 ## Requirements
 
@@ -139,10 +220,12 @@ it does not). Unusual install location? Point at it with `CLAUDE_NATIVE_BIN=/pat
 
 - Tokens are validated against `claude auth status` before being stored.
 - `status` and `doctor` print SHA-256 fingerprints, never secrets.
-- Every removal from the active Keychain slot is preceded by an archive copy, verified by
-  fingerprint.
-- `~/.claude.json` account metadata is backed up before being stripped.
-- On machines without Orca, the restart helper is skipped entirely and nothing is killed.
+- The native credential is never deleted from the live slot; before anything displaces it, the
+  archive of the profile that owns it is refreshed, so a rotated refresh token is never lost.
+- No process is ever killed by a switch. The old `lib/restart-orca.sh` helper is kept in the repo
+  for reference only and the installer no longer installs it (it sent SIGTERM to every `claude`
+  process, which kills background jobs and workers).
+- `measure` spends one output token per profile per run and prints fingerprints only.
 
 ## Docs
 

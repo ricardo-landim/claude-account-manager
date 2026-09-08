@@ -1,0 +1,243 @@
+#!/usr/bin/env bash
+# claude-account-regime: what the quota allows RIGHT NOW, as one word.
+#
+# One rule, many readers. The Claude Code hooks (Agent/Workflow guards), the
+# prompt context line, the status line, the session launcher and any other
+# automation all ask this command instead of each doing its own arithmetic.
+#
+# The rule is the same projection the status line gauge uses: for each window
+# (5h, 7d) of the ACTIVE account, project where usage lands at reset from the
+# average pace so far (floor of 15 min on 5h, 24 h on 7d, so the first minutes
+# of a window do not explode the estimate). Reserve = 100 - projection, in
+# percentage points. The tighter window rules.
+#
+#   livre     reserve >= atencao (25): nothing to do
+#   atencao   reserve in [economia, atencao): heads up only
+#   economia  reserve < economia (0): at this pace a window empties before it
+#             resets; heavy things get downgraded until the reset
+#   pouso     would be economia, but the 5h reset is close (<= pouso_min) and
+#             usage + recent pace fits under 100 until then: no brake
+#   trava     both accounts are out (rejected, or paying overage), measured as
+#             such; an unknown probe never locks anything
+#
+# Hysteresis lives in regime.state.json: a change needs `hyst` consecutive
+# measurements (the autoswitch measures every 5 min) and economia holds at
+# least hold_min. A read that sees no new measurement never advances the
+# state, so hooks can call this as often as they like.
+#
+# Overrides: `regime livre --por 30m` / `regime economia --por 1h` / `regime auto`.
+# A measurement older than stale_min is treated as livre and says so: a dead
+# probe must never freeze the work.
+#
+# Output is TOON (key: value lines) by default, `--json` for programs.
+# Exit codes: 0 ok, 1 error, 2 usage error.
+set -euo pipefail
+
+CONFIG_DIR="${CLAUDE_ACCOUNT_HOME:-$HOME/.config/claude-account}"
+MEASURE="$CONFIG_DIR/measure.json"
+POLICY="$CONFIG_DIR/policy.json"
+STATE="$CONFIG_DIR/regime.state.json"
+OVERRIDE="$CONFIG_DIR/regime.override.json"
+ACTIVE_FILE="$CONFIG_DIR/active"
+
+usage() {
+  cat <<'EOF'
+Usage:
+  claude-account regime [--json]                 current regime (computes, advances hysteresis on new measurement)
+  claude-account regime livre --por <dur>        force livre for <dur> (30m, 2h)
+  claude-account regime economia --por <dur>     force economia for <dur>
+  claude-account regime auto                     drop the override
+
+Regimes: livre, atencao, economia, pouso, trava. Tunables live in policy.json under "regime".
+Exit codes: 0 ok, 1 error, 2 usage error.
+EOF
+}
+usage_error() { printf 'error: %s\ncode: USAGE\nhelp: claude-account regime --help\n' "$*"; exit 2; }
+
+command -v jq >/dev/null 2>&1 || { printf 'error: jq not installed\ncode: MISSING_DEP\n'; exit 1; }
+
+parse_dur() {  # 30m | 2h | 90s -> seconds
+  case "$1" in
+    *m) printf '%s' $(( ${1%m} * 60 )) ;;
+    *h) printf '%s' $(( ${1%h} * 3600 )) ;;
+    *s) printf '%s' "${1%s}" ;;
+    *) usage_error "duration must look like 30m, 2h or 90s" ;;
+  esac
+}
+
+now=$(date -u +%s)
+json=0
+sub=""; dur=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --json) json=1 ;;
+    -h|--help) usage; exit 0 ;;
+    livre|economia|auto) sub="$1" ;;
+    --por) shift; [ $# -gt 0 ] || usage_error "--por needs a duration"; dur="$1" ;;
+    *) usage_error "unknown option: $1" ;;
+  esac
+  shift
+done
+
+if [ -n "$sub" ]; then
+  mkdir -p "$CONFIG_DIR"
+  if [ "$sub" = auto ]; then
+    rm -f "$OVERRIDE"; printf 'override: none\nregime: auto\n'; exit 0
+  fi
+  [ -n "$dur" ] || usage_error "$sub needs --por <dur>"
+  secs=$(parse_dur "$dur")
+  jq -n --arg r "$sub" --argjson until $(( now + secs )) '{regime: $r, until: $until}' > "$OVERRIDE"
+  printf 'override: %s\nuntil: %s\n' "$sub" "$(date -r $(( now + secs )) +%H:%M)"
+  exit 0
+fi
+
+# A broken or half-written file is treated as empty: the regime must answer
+# even when a concurrent writer left junk behind.
+load_json() {  # jq on an EMPTY file prints nothing and exits 0, so check the output too
+  local out=""
+  [ -f "$1" ] && out=$(jq -c . "$1" 2>/dev/null) || out=""
+  if [ -n "$out" ]; then printf '%s' "$out"; else echo '{}'; fi
+}
+policy=$(load_json "$POLICY")
+measure=$(load_json "$MEASURE")
+state=$(load_json "$STATE")
+override=$(load_json "$OVERRIDE")
+# Which account THIS process actually uses, not the one marked active. A switch
+# never touches a running session (the token rides in the environment from
+# birth), so a session that started before the switch must be measured against
+# the account it really talks to, otherwise a hook brakes on the wrong numbers.
+# Fingerprints are cached: this runs on every Agent and Workflow call.
+FP_CACHE="$CONFIG_DIR/fp-cache"
+account_from_env() {
+  REPLY=""
+  [ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ] || return 0
+  local fp; fp=$(printf '%s' "$CLAUDE_CODE_OAUTH_TOKEN" | shasum -a 256 | cut -c1-12)
+  REPLY=$(grep "^${fp} " "$FP_CACHE" 2>/dev/null | head -1 | cut -d' ' -f2 || true)
+  [ -n "$REPLY" ] && return 0
+  local pf svc v
+  for pf in "$CONFIG_DIR"/profiles/*.json; do
+    [ -f "$pf" ] || continue
+    [ "$(jq -r '.type' "$pf" 2>/dev/null)" = oauth_token ] || continue
+    svc=$(jq -r '.keychainService' "$pf" 2>/dev/null) || continue
+    v=$(security find-generic-password -a "$USER" -s "$svc" -w 2>/dev/null) || continue
+    if [ "$(printf '%s' "$v" | shasum -a 256 | cut -c1-12)" = "$fp" ]; then
+      REPLY=$(jq -r '.name' "$pf"); printf '%s %s\n' "$fp" "$REPLY" >> "$FP_CACHE"
+      break
+    fi
+  done
+  unset v
+  return 0
+}
+account_from_env; active="$REPLY"
+[ -z "$active" ] && [ -f "$ACTIVE_FILE" ] && active=$(tr -d '[:space:]' < "$ACTIVE_FILE")
+
+result=$(jq -n --argjson now "$now" --argjson policy "$policy" --argjson m "$measure" \
+  --argjson state "$state" --argjson override "$override" --arg active "$active" '
+  def cfg(k; d): ($policy.regime // {})[k] // d;
+  def clamp(lo; hi): if . < lo then lo elif . > hi then hi else . end;
+  # reserve(u; reset; win; floor): null while the window is too young to have a pace
+  def reserve(u; reset; win; floor):
+    if u == null or reset == null then null else
+      ((reset - $now) | clamp(0; win)) as $left | (win - $left) as $elapsed |
+      if $elapsed < 900 then null else (100 - (u * win / ([$elapsed, floor] | max)) | round) end
+    end;
+  (cfg("atencao"; 25)) as $th_att | (cfg("economia"; 0)) as $th_eco |
+  (cfg("pouso_min"; 30)) as $pouso_min | (cfg("hyst"; 2)) as $hyst |
+  (cfg("hold_min"; 15)) as $hold_min | (cfg("stale_min"; 15)) as $stale_min |
+  (cfg("floor7_h"; 24) * 3600) as $floor7 | (cfg("pool_softens"; true)) as $pool_softens |
+  ($policy.preferred // "") as $pref | ($policy.fallback // "") as $fall |
+  (if $active != "" then $active else $pref end) as $acct |
+  (if $acct == $pref then $fall else $pref end) as $other |
+  ($m.profiles[$acct] // {}) as $p | ($m.profiles[$other] // {}) as $q |
+  ($m.measured_at // null) as $mat |
+  (if $mat == null then null else ($mat | sub("Z$"; "") | strptime("%Y-%m-%dT%H:%M:%S") | mktime) end) as $mts |
+  (if $mts == null then null else (($now - $mts) / 60 | floor) end) as $age_min |
+  reserve($p.util_5h; $p.reset_5h; 18000; 900) as $r5 |
+  reserve($p.util_7d; $p.reset_7d; 604800; $floor7) as $r7 |
+  reserve($q.util_5h; $q.reset_5h; 18000; 900) as $o5 |
+  reserve($q.util_7d; $q.reset_7d; 604800; $floor7) as $o7 |
+  ([$r5, $r7] | map(select(. != null))) as $cands |
+  (if ($cands | length) == 0 then null else ($cands | min) end) as $res |
+  (if $res == null then "" elif $r5 == $res then "5h" else "7d" end) as $causa |
+  (($p.reset_5h // $now) - $now | clamp(0; 18000)) as $left5 |
+  # recent pace of the active account over the last 30 min of history (points/s), for the landing check
+  (($m.history[$acct] // []) | map(select(.[0] > ($now - 1800) and .[1] != null))) as $h |
+  (if ($h | length) >= 2 and ($h[-1][0] - $h[0][0]) > 0 then (($h[-1][1] - $h[0][1]) | if . < 0 then 0 else . end) / ($h[-1][0] - $h[0][0]) else 0 end) as $rate |
+  (($p.util_5h // 0) + $rate * $left5 < 100) as $cabe |
+  # "out" is a measured fact (rejected, or paying overage); unknown is a dead probe, never a lock
+  ((($p.status // "") == "rejected") or ($p.overage_in_use // false)) as $acct_out |
+  ((($q.status // "") == "rejected") or ($q.overage_in_use // false)) as $other_out |
+  ((($q.status // "") == "allowed") and ([$o5, $o7] | map(select(. != null)) | (length == 0 or min >= $th_att))) as $pool_room |
+  (if $acct_out and $other_out then "trava"
+   elif $res == null then "livre"
+   elif $res >= $th_att then "livre"
+   elif $res >= $th_eco then "atencao"
+   elif $causa == "5h" and $left5 <= $pouso_min * 60 and $cabe and ($r7 == null or $r7 >= $th_eco) then "pouso"
+   elif $pool_softens and $pool_room then "atencao"
+   else "economia" end) as $raw |
+  (if $causa == "5h" then $p.reset_5h elif $causa == "7d" then $p.reset_7d else null end) as $reset |
+  # --- hysteresis: advance only on a measurement not seen before; trava is immediate both ways (measured fact) ---
+  ($state.regime // "livre") as $cur |
+  (if ($state.last_measured_at // "") == $mat and $cur != "trava" and $raw != "trava" then $state
+   elif $raw == $cur then $state + {regime: $raw, pending: null, pending_n: 0, since: ($state.since // $now), last_measured_at: $mat}
+   elif $raw == "trava" or $cur == "trava" then $state + {regime: $raw, pending: null, pending_n: 0, since: $now, last_measured_at: $mat, hold_until: 0}
+   else
+     (if $state.pending == $raw then ($state.pending_n // 0) + 1 else 1 end) as $n |
+     (($cur == "economia") and (($state.hold_until // 0) > $now)) as $held |
+     if $n >= $hyst and ($held | not)
+     then {regime: $raw, pending: null, pending_n: 0, since: $now, last_measured_at: $mat,
+           hold_until: (if $raw == "economia" then $now + $hold_min * 60 else 0 end)}
+     else $state + {pending: $raw, pending_n: $n, last_measured_at: $mat} end
+   end) as $ns |
+  ($ns.regime // "livre") as $settled |
+  # --- override and stale measurement win over everything ---
+  (($override.until // 0) > $now) as $ov |
+  ($age_min == null or $age_min > $stale_min) as $stale |
+  (if $ov then $override.regime elif $stale then "livre" else $settled end) as $final |
+  {regime: $final, raw: $raw, conta_de: (if $active != "" then "sessao" else "perfil ativo" end), causa: (if $final == "livre" then "" else $causa end),
+   reserva: $res, reserva_5h: $r5, reserva_7d: $r7,
+   reset: $reset, reset_em: (if $reset == null then null else ($reset - $now) end),
+   conta: $acct, marca: (if $acct == $pref then 1 else 2 end),
+   pool: (if $pool_room then "reserva disponivel" else "sem reserva" end),
+   override: (if $ov then "\($override.regime) ate \($override.until | strflocaltime("%H:%M"))" else "none" end),
+   medido_ha_min: $age_min, medida_velha: $stale, pendente: ($ns.pending // null), pendente_n: ($ns.pending_n // 0),
+   state: $ns}')
+
+# Only a call that changed the state writes it (a plain read never touches the
+# file), and the write happens under a mkdir lock so two writers cannot rename
+# a stale result over a newer one. A lock older than 10 s is a dead process.
+newstate=$(printf '%s' "$result" | jq -c '.state' 2>/dev/null || echo '')
+if [ -n "$newstate" ] && [ "$newstate" != "$(printf '%s' "$state" | jq -c . 2>/dev/null)" ]; then
+  lock="$STATE.lock"; i=0
+  while ! mkdir "$lock" 2>/dev/null; do
+    i=$((i + 1))
+    if [ $i -gt 20 ]; then
+      if [ -n "$(find "$lock" -maxdepth 0 -mmin +0.17 2>/dev/null)" ]; then rm -rf "$lock"; else break; fi
+    fi
+    sleep 0.1
+  done
+  if [ -d "$lock" ]; then
+    tmp="$STATE.$$.tmp"
+    if printf '%s\n' "$newstate" > "$tmp" 2>/dev/null && [ -s "$tmp" ]; then mv "$tmp" "$STATE"; else rm -f "$tmp"; fi
+    rmdir "$lock" 2>/dev/null || true
+  fi
+fi
+
+if [ $json -eq 1 ]; then
+  printf '%s\n' "$result" | jq 'del(.state)'
+  exit 0
+fi
+printf '%s\n' "$result" | jq -r '
+  def fmt_em: if . == null then "-" elif . >= 86400 then "\(. / 86400 | floor)d \((. % 86400) / 3600 | floor)h" elif . >= 3600 then "\(. / 3600 | floor)h\((. % 3600) / 60 | floor | tostring | if length < 2 then "0" + . else . end)" else "\(. / 60 | floor)m" end;
+  "regime: \(.regime)",
+  (if .causa != "" then "causa: \(.causa)" else empty end),
+  "reserva: \(.reserva // "-")",
+  "reserva_5h: \(.reserva_5h // "-")",
+  "reserva_7d: \(.reserva_7d // "-")",
+  (if .reset != null then "reset: \(.reset | strflocaltime("%H:%M")) (em \(.reset_em | fmt_em))" else empty end),
+  "conta: \(.conta) (\(.marca)º)",
+  "pool: \(.pool)",
+  (if .override != "none" then "override: \(.override)" else empty end),
+  (if .medida_velha then "aviso: medida com \(.medido_ha_min // "?") min, tratada como livre" else "medido_ha: \(.medido_ha_min)m" end),
+  (if .pendente != null then "pendente: \(.pendente) (\(.pendente_n) de 2 medicoes)" else empty end),
+  "help: claude-account regime livre --por 30m | economia --por 1h | auto"'

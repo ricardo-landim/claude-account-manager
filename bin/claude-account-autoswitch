@@ -1,0 +1,145 @@
+#!/usr/bin/env bash
+# Headless account switcher for Claude Code. Runs from launchd every few minutes,
+# measures every profile through `claude-account measure` and switches the active
+# profile when the preferred account is exhausted and the fallback still has room.
+# Zero AI, zero token spent beyond one haiku output token per profile per run.
+#
+# Policy file: $CONFIG_DIR/policy.json
+#   {
+#     "preferred": "work",
+#     "fallback": "personal",
+#     "exhausted_at": {"five_hour": 0.95, "seven_day": 0.97},
+#     "return_below": {"five_hour": 0.70, "seven_day": 0.90},
+#     "min_switch_interval_min": 10,
+#     "max_switches_per_day": 12
+#   }
+# Kill switch: touch $CONFIG_DIR/autoswitch.off
+set -uo pipefail
+
+CONFIG_DIR="${CLAUDE_ACCOUNT_HOME:-$HOME/.config/claude-account}"
+POLICY="$CONFIG_DIR/policy.json"
+STATE="$CONFIG_DIR/autoswitch-state.json"
+LOG="$CONFIG_DIR/autoswitch.log"
+OFF="$CONFIG_DIR/autoswitch.off"
+CLI="$HOME/bin/claude-account"
+
+dry_run=false
+for arg in "$@"; do
+  case "$arg" in
+    --dry-run) dry_run=true ;;
+    -h|--help)
+      echo "usage: claude-account-autoswitch [--dry-run]"
+      echo "Measures every profile and switches when policy says so. Exit 0 always except usage error (2)."
+      exit 0 ;;
+    *) echo "error: unknown flag $arg" >&2; echo "help: claude-account-autoswitch [--dry-run]" >&2; exit 2 ;;
+  esac
+done
+
+now_iso() { date -u +%Y-%m-%dT%H:%M:%SZ; }
+log() { printf '%s %s\n' "$(now_iso)" "$*" | tee -a "$LOG"; }
+
+[ -x "$CLI" ] || { log "error=cli_missing path=$CLI"; exit 1; }
+[ -f "$POLICY" ] || { log "error=policy_missing path=$POLICY"; exit 1; }
+if [ -e "$OFF" ]; then log "skip=kill_switch file=$OFF"; exit 0; fi
+
+pref="$(jq -r '.preferred' "$POLICY")"
+fall="$(jq -r '.fallback' "$POLICY")"
+t5="$(jq -r '.exhausted_at.five_hour // 0.95' "$POLICY")"
+t7="$(jq -r '.exhausted_at.seven_day // 0.97' "$POLICY")"
+b5="$(jq -r '.return_below.five_hour // 0.70' "$POLICY")"
+b7="$(jq -r '.return_below.seven_day // 0.90' "$POLICY")"
+min_int="$(jq -r '.min_switch_interval_min // 10' "$POLICY")"
+max_day="$(jq -r '.max_switches_per_day // 12' "$POLICY")"
+
+active="$(tr -d '[:space:]' < "$CONFIG_DIR/active" 2>/dev/null || true)"
+measured="$("$CLI" measure "$pref" "$fall" 2>/dev/null | tail -n +2 | sed 's/^  //')"
+line_pref="$(printf '%s\n' "$measured" | grep "^$pref," || true)"
+line_fall="$(printf '%s\n' "$measured" | grep "^$fall," || true)"
+
+field() { printf '%s' "$1" | cut -d, -f"$2"; }
+
+# Cache legivel da medicao (a statusline le daqui: o payload do Claude Code so
+# atualiza quando a propria sessao recebe resposta, entao fica velho em sessao
+# parada). Fracoes 0-1 dos headers viram 0-100 aqui.
+# Guarda tambem as ultimas 24 amostras (2h) de uso da janela de 5h por perfil:
+# e o que permite ler o PADRAO de consumo (sparkline e tendencia), nao so o nivel.
+MEASURE_CACHE="$CONFIG_DIR/measure.json"
+prev_hist="$(jq -c '.history // {}' "$MEASURE_CACHE" 2>/dev/null || echo '{}')"
+printf '%s\n' "$measured" | jq -R -s --arg at "$(now_iso)" --argjson ts "$(date -u +%s)" --argjson hist "$prev_hist" '
+  split("\n") | map(select(length > 0) | split(",")) |
+  map({key: .[0], value: {status: .[1], util_5h: ((.[3] | tonumber? // null) | if . == null then null else (. * 100 | round) end),
+       reset_5h: (.[4] | tonumber? // null), util_7d: ((.[5] | tonumber? // null) | if . == null then null else (. * 100 | round) end),
+       reset_7d: (.[6] | tonumber? // null), overage: (.[7] // null), overage_in_use: (.[8] == "true")}}) | from_entries as $p |
+  {measured_at: $at, profiles: $p,
+   history: ($p | to_entries | map({key: .key, value: ((($hist[.key] // []) + [[$ts, .value.util_5h]]) | .[-24:])}) | from_entries)}' \
+  > "$MEASURE_CACHE.tmp" 2>/dev/null && mv "$MEASURE_CACHE.tmp" "$MEASURE_CACHE"
+# Every measurement advances the regime (hysteresis counts measurements, not reads).
+"$(dirname "$CLI")/claude-account-regime" --json >/dev/null 2>&1 || true
+
+# room <line> <t5> <t7>: 0 when the account can take traffic under the thresholds.
+room() {
+  st="$(field "$1" 2)"; u5="$(field "$1" 4)"; u7="$(field "$1" 6)"
+  [ "$st" = allowed ] || return 1
+  awk -v u5="${u5:-0}" -v u7="${u7:-0}" -v t5="$2" -v t7="$3" 'BEGIN{exit !((u5+0) < (t5+0) && (u7+0) < (t7+0))}'
+}
+
+decision="$active"; reason=stay
+if [ "$active" = "$pref" ] || [ -z "$active" ]; then
+  if room "$line_pref" "$t5" "$t7"; then
+    decision="$pref"; reason=preferred_has_room
+  elif room "$line_fall" "$t5" "$t7"; then
+    decision="$fall"; reason=preferred_exhausted_fallback_has_room
+  else
+    decision="$pref"; reason=both_exhausted_stay_preferred
+  fi
+elif [ "$active" = "$fall" ]; then
+  # Hysteresis: only go back when the preferred account has real room again.
+  if room "$line_pref" "$b5" "$b7"; then
+    decision="$pref"; reason=preferred_recovered
+  elif room "$line_fall" "$t5" "$t7"; then
+    decision="$fall"; reason=fallback_still_has_room
+  elif room "$line_pref" "$t5" "$t7"; then
+    decision="$pref"; reason=fallback_exhausted_preferred_has_room
+  else
+    decision="$fall"; reason=both_exhausted_stay
+  fi
+else
+  # A profile outside the policy is active (manual choice); never override it.
+  decision="$active"; reason=manual_profile_active
+fi
+
+summary="active=$active decision=$decision reason=$reason pref=[$(field "$line_pref" 2)/5h=$(field "$line_pref" 4)/7d=$(field "$line_pref" 6)] fall=[$(field "$line_fall" 2)/5h=$(field "$line_fall" 4)/7d=$(field "$line_fall" 6)]"
+
+if [ "$decision" = "$active" ]; then
+  log "$summary"
+  exit 0
+fi
+
+# Guard rails: minimum interval between switches and a hard daily cap.
+last_ts="$(jq -r '.lastSwitchAt // 0' "$STATE" 2>/dev/null || echo 0)"
+today="$(date -u +%Y-%m-%d)"
+count_today="$(jq -r --arg d "$today" 'if .day == $d then (.count // 0) else 0 end' "$STATE" 2>/dev/null || echo 0)"
+now_epoch="$(date -u +%s)"
+if [ $((now_epoch - last_ts)) -lt $((min_int * 60)) ]; then
+  log "$summary held=min_interval"
+  exit 0
+fi
+if [ "$count_today" -ge "$max_day" ]; then
+  log "$summary held=daily_cap($max_day)"
+  exit 0
+fi
+
+if [ "$dry_run" = true ]; then
+  log "$summary dry_run=would_switch"
+  exit 0
+fi
+
+if out="$("$CLI" use "$decision" 2>&1)"; then
+  jq -n --arg d "$today" --argjson c $((count_today + 1)) --argjson t "$now_epoch" \
+    --arg from "$active" --arg to "$decision" --arg why "$reason" \
+    '{day:$d,count:$c,lastSwitchAt:$t,from:$from,to:$to,reason:$why}' > "$STATE.tmp" && mv "$STATE.tmp" "$STATE"
+  log "$summary switched=$active->$decision"
+else
+  log "$summary switch_failed=$(printf '%s' "$out" | tr '\n' ' ' | cut -c1-200)"
+fi
+exit 0

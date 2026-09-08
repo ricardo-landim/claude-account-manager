@@ -19,21 +19,25 @@ mkdir -p "$LIB" "$BIN" "$CONFIG/profiles"
 chmod 700 "$LIB" "$CONFIG" "$CONFIG/profiles"
 
 install -m 700 "$ROOT/bin/claude-account" "$BIN/claude-account"
+install -m 700 "$ROOT/bin/claude-account-autoswitch" "$BIN/claude-account-autoswitch"
 install -m 700 "$ROOT/bin/claude" "$BIN/claude"
 install -m 600 "$ROOT/lib/shell-init.zsh" "$LIB/shell-init.zsh"
 
-if [ -d "/Applications/Orca.app" ] || [ -d "$HOME/Applications/Orca.app" ]; then
-  install -m 700 "$ROOT/lib/restart-orca.sh" "$LIB/restart-orca.sh"
-  echo "Orca detected: restart helper installed."
-else
-  echo "Orca not detected: restart helper skipped. After switching accounts, restart your terminal sessions."
-fi
+# The restart-orca helper is no longer installed: it sent SIGTERM to every
+# `claude` process, which kills background jobs and workers. New sessions pick
+# the active profile up on their own; nothing running is ever touched.
+rm -f "$LIB/restart-orca.sh"
 
+echo "Installed: $BIN/claude-account, $BIN/claude-account-autoswitch, $BIN/claude (wrapper)."
 echo
-echo "Installed. Add this line to your ~/.zprofile:"
-# $HOME must stay literal in the printed instruction.
+echo "Shell integration: if your shell already defines a claude() function (claude-stable"
+echo "setups), route it through the profile: CLAUDE_NATIVE_BIN=\"\$bin\" \"\$HOME/bin/claude-account\" exec ..."
+echo "Otherwise add to ~/.zprofile:"
 # shellcheck disable=SC2016
 printf '  [ -r "$HOME/.local/lib/claude-account-manager/shell-init.zsh" ] && source "$HOME/.local/lib/claude-account-manager/shell-init.zsh"\n'
+echo
+echo "Automatic switching is opt-in: write $CONFIG/policy.json and schedule"
+echo "$BIN/claude-account-autoswitch every 5 minutes (launchd or cron); see README."
 
 resolved="$(command -v claude 2>/dev/null || true)"
 if [ "$resolved" != "$BIN/claude" ]; then

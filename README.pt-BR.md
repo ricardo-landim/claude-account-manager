@@ -35,7 +35,7 @@ troca:        claude-account use <nome> — atômica em todas as camadas
 camadas:      slots do Keychain · launchctl · ~/.claude.json · daemon · shells
 segurança:    credencial deslocada é arquivada antes, verificada por fingerprint
 diagnóstico:  doctor · status · probe (fingerprints SHA-256, nunca segredos)
-extras:       integração Orca opcional · override CLAUDE_NATIVE_BIN
+extras:       medição de rate limit · troca automática · regime de cota · override CLAUDE_NATIVE_BIN
 ```
 
 ## O problema
@@ -92,9 +92,9 @@ claude-account use pessoal
 ```
 
 > [!NOTE]
-> O `use` reinicia o [Orca](https://orca.dev) (se instalado) pros processos vivos trocarem também;
-> use `--no-restart` pra pular. Shells novos sempre pegam o perfil ativo; sessões já abertas
-> seguem na conta anterior até reiniciar.
+> O `use` nunca derruba nada. Processos `claude` novos pegam o perfil ativo sozinhos; sessões já
+> abertas seguem na conta em que nasceram (o token vai no ambiente delas desde o início). Passe
+> `--stop-daemon` se quiser reiniciar também o daemon do Claude.
 
 ## Comandos
 
@@ -107,6 +107,87 @@ claude-account use pessoal
 | 🩺 | `doctor` | checa divergência em todas as camadas |
 | 📊 | `status` | perfil ativo + fingerprints (nunca os segredos) |
 | 🧪 | `probe` | autentica e roda uma inferência mínima |
+| 📈 | `measure [nome...]` | estado das janelas de 5h e 7d por perfil, lido dos headers de resposta |
+| 🚦 | `regime [--json]` | uma palavra dizendo o que a cota permite agora |
+| ▶️ | `exec [args...]` | roda o binário nativo sob o perfil ativo (o que o wrapper faz) |
+
+## Rate limit, troca automática e regime de cota
+
+Três peças em cima da troca de perfil, tudo shell + `jq`, sem dependência nova.
+
+### `measure`
+
+Manda uma requisição de um token à API com o token de cada perfil e lê os headers
+`anthropic-ratelimit-unified-*` da resposta: utilização e horário de reset das janelas de 5 horas
+e 7 dias, e se a conta está pagando excedente. Imprime só fingerprints, nunca um token. Perfil
+nativo (`/login`) não tem setup-token pra medir; dê um da mesma conta:
+
+```bash
+claude-account add-oauth pessoal-medida --measure-for pessoal
+```
+
+### `claude-account-autoswitch`
+
+Um job pra launchd ou cron, a cada 5 minutos. Mede os dois perfis nomeados em
+`~/.config/claude-account/policy.json`, move o perfil ativo pro `fallback` quando o `preferred`
+bate os limiares de esgotamento, e volta quando o `preferred` tem folga de novo (histerese,
+intervalo mínimo entre trocas e teto diário). Também grava o `measure.json` com as últimas 24
+amostras por perfil, pra status line ou qualquer outro leitor consumir um arquivo em vez de chamar
+a API.
+
+```json
+{
+  "preferred": "trabalho",
+  "fallback": "pessoal",
+  "exhausted_at": {"five_hour": 0.95, "seven_day": 0.97},
+  "return_below": {"five_hour": 0.70, "seven_day": 0.90},
+  "min_switch_interval_min": 10,
+  "max_switches_per_day": 12
+}
+```
+
+Botão de desligar: `touch ~/.config/claude-account/autoswitch.off`. Log: `autoswitch.log`. Perfil
+fora da política ativado à mão nunca é sobrescrito. Experimente com `--dry-run` antes. Um
+LaunchAgent que roda a cada 5 minutos:
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>local.claude-account.autoswitch</string>
+  <key>ProgramArguments</key><array><string>/Users/VOCE/bin/claude-account-autoswitch</string></array>
+  <key>StartInterval</key><integer>300</integer>
+  <key>RunAtLoad</key><true/>
+</dict></plist>
+```
+
+Salve como `~/Library/LaunchAgents/local.claude-account.autoswitch.plist` e carregue com
+`launchctl bootstrap gui/$(id -u) <caminho>`.
+
+### `regime`
+
+Uma palavra que diz o que a cota permite agora, projetada pelo ritmo médio de cada janela da conta
+que **esta sessão** realmente usa (uma troca nunca move sessão que já está rodando):
+
+| Regime | Significado |
+|---|---|
+| `livre` | reserva no reset é confortável, nada a fazer |
+| `atencao` | no ritmo de chegar perto do limite, só aviso |
+| `economia` | nesse ritmo uma janela esvazia antes do reset; trabalho pesado é rebaixado |
+| `pouso` | seria `economia`, mas o reset de 5h está perto e o ritmo recente cabe abaixo de 100% |
+| `trava` | as duas contas fora (rejeitadas ou pagando excedente), medido como tal |
+
+Mudança exige duas medições seguidas, `economia` segura 15 minutos, `trava` é imediata nos dois
+sentidos porque é fato medido, e medição com mais de 15 minutos (ou sonda morta) nunca trava nada.
+Override com validade: `regime livre --por 30m`, `regime economia --por 1h`, `regime auto`. Em
+`economia` ou `trava`, o `exec` (e portanto o wrapper `claude`) abre a sessão nova com
+`--effort medium`, a menos que você passe `--effort`. Hooks e status line leem `regime --json`
+(uns 30 ms, sem rede). Ajustes ficam no `policy.json` sob `"regime"`.
+
+Por que projeção de ritmo em vez de "uso acima de N%": limiar reage tarde. Nas duas manhãs de uma
+semana de transcrições reais em que uma janela de 5h passou de 100%, um limiar de 80% avisou 20 e
+75 minutos antes; a projeção avisou umas 3 horas antes, com 35 minutos de freio desnecessário na
+semana inteira. Testes de cenário offline: `tests/regime-scenarios.sh`.
 
 ## Troubleshooting
 
@@ -119,11 +200,11 @@ Se acontecer mesmo assim, o `doctor` pega:
 
 ```
 [FAIL] launchctl diverges from the active profile
-[FAIL] a stale native login is still active (it shadows the setup-token)
 ```
 
-A correção é um comando, sem reboot: `claude-account use <qualquer-perfil>`. A credencial do
-`/login` não se perde; ela é arquivada no Keychain como o perfil `primary` antes do slot ser limpo.
+A correção é um comando, sem reboot: `claude-account use <qualquer-perfil>`. Login nativo achado no
+slot vivo nunca é apagado: o `CLAUDE_CODE_OAUTH_TOKEN` vence, e sessões nativas rodando seguem
+renovando o próprio token. Rode `claude-account import-native <nome>` se quiser ele como perfil.
 
 ## Requisitos
 
@@ -139,10 +220,12 @@ vier). Instalação em lugar incomum? Aponte com `CLAUDE_NATIVE_BIN=/path/to/cla
 
 - Tokens são validados contra `claude auth status` antes de serem guardados.
 - `status` e `doctor` imprimem fingerprints SHA-256, nunca segredos.
-- Toda remoção do slot ativo do Keychain é precedida de cópia de arquivo, verificada por
-  fingerprint.
-- O metadado de conta em `~/.claude.json` é backupeado antes de ser limpo.
-- Em máquina sem Orca, o helper de restart nem é instalado e nada é derrubado.
+- A credencial nativa nunca é apagada do slot vivo; antes de qualquer coisa deslocá-la, o arquivo
+  do perfil dono dela é atualizado, então um refresh token rotacionado nunca se perde.
+- Nenhum processo é derrubado numa troca. O antigo `lib/restart-orca.sh` fica no repo só como
+  referência e o instalador não o instala mais (ele mandava SIGTERM pra todo processo `claude`,
+  o que mata jobs em segundo plano e workers).
+- `measure` gasta um token de saída por perfil por rodada e imprime só fingerprints.
 
 ## Docs
 
