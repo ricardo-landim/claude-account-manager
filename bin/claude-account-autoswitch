@@ -134,7 +134,8 @@ if [ "$dry_run" = true ]; then
   exit 0
 fi
 
-if out="$("$CLI" use "$decision" 2>&1)"; then
+# Headless: never restart Orca or kill anything; new processes pick the profile up.
+if out="$("$CLI" use "$decision" --no-restart 2>&1)"; then
   jq -n --arg d "$today" --argjson c $((count_today + 1)) --argjson t "$now_epoch" \
     --arg from "$active" --arg to "$decision" --arg why "$reason" \
     '{day:$d,count:$c,lastSwitchAt:$t,from:$from,to:$to,reason:$why}' > "$STATE.tmp" && mv "$STATE.tmp" "$STATE"

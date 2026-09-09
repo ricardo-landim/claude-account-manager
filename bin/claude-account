@@ -2,20 +2,15 @@
 # Profile manager for multiple Claude Code accounts on macOS.
 # Secrets live exclusively in the macOS Keychain; this file never contains tokens.
 #
-# This revision (2026-09) differs from the first release in three points, all
-# verified on Claude Code 2.1.x before changing anything:
-#   1. CLAUDE_CODE_OAUTH_TOKEN wins over the native Keychain login, so switching
-#      to a setup-token profile never deletes the native credential (`auth status`
-#      returns authMethod=oauth_token with both present). Running native sessions
-#      keep refreshing their token; nothing is stripped from ~/.claude.json.
-#   2. No process is ever killed. The original restart-orca helper sent SIGTERM to
-#      every `claude` process, which kills background jobs and long-running
-#      workers. New processes pick the active profile; old ones keep
-#      the account they started with.
-#   3. `measure` reads the real rate-limit state of every profile from the
-#      anthropic-ratelimit-unified-* headers (a setup-token has inference scope
-#      only, so /api/oauth/usage is not available to it), which is what
-#      claude-account-autoswitch uses to decide.
+# `use <name>` switches every auth layer atomically (Keychain slots, launchctl,
+# ~/.claude.json metadata, Claude daemon) and, when Orca is installed, restarts
+# it so live processes switch too; `--no-restart` skips the restart. The
+# headless switcher (claude-account-autoswitch) always passes `--no-restart`.
+#
+# `measure` reads the real rate-limit state of every profile from the
+# anthropic-ratelimit-unified-* headers (a setup-token has inference scope only,
+# so /api/oauth/usage is not available to it), which is what
+# claude-account-autoswitch uses to decide.
 set -euo pipefail
 
 CONFIG_DIR="${CLAUDE_ACCOUNT_HOME:-$HOME/.config/claude-account}"
@@ -170,6 +165,35 @@ stop_claude_daemon() {
   "$NATIVE_BIN" daemon stop --any >/dev/null 2>&1 || true
 }
 
+remove_native_active() {
+  if keychain_has "$NATIVE_SERVICE"; then
+    security delete-generic-password -a "$USER" -s "$NATIVE_SERVICE" >/dev/null
+  fi
+}
+
+strip_stale_account_metadata() {
+  file="$HOME/.claude.json"
+  [ -f "$file" ] || return 0
+  jq -e 'has("oauthAccount")' "$file" >/dev/null 2>&1 || return 0
+  stamp="$(date +%Y%m%d-%H%M%S)"
+  cp "$file" "$file.bak-claude-account-$stamp"
+  tmp="$(mktemp)"
+  jq 'del(.oauthAccount)' "$file" > "$tmp"
+  chmod 600 "$tmp"
+  mv "$tmp" "$file"
+  note "previous oauthAccount metadata archived at $file.bak-claude-account-$stamp"
+}
+
+schedule_orca_restart() {
+  helper="$HOME/.local/lib/claude-account-manager/restart-orca.sh"
+  if [ ! -x "$helper" ]; then
+    note "restart your terminal sessions (and Orca, if you use it) for the switch to take effect"
+    return 0
+  fi
+  nohup "$helper" >/tmp/claude-account-restart-orca.log 2>&1 </dev/null &
+  note "Orca will restart shortly"
+}
+
 validate_token() {
   auth_json="$(CLAUDE_CODE_OAUTH_TOKEN="$1" "$NATIVE_BIN" auth status 2>/dev/null || true)"
   [ "$(printf '%s' "$auth_json" | jq -r '.loggedIn // false' 2>/dev/null)" = true ]
@@ -234,50 +258,46 @@ cmd_import_native() {
 cmd_use() {
   name="${1:-}"
   shift || true
-  stop_daemon=false
+  restart=true
   while [ "$#" -gt 0 ]; do
     case "$1" in
-      --stop-daemon) stop_daemon=true ;;
-      --no-restart|--restart-orca) ;;
+      --restart-orca) restart=true ;;
+      --no-restart) restart=false ;;
       *) usage_error "unknown option: $1" ;;
     esac
     shift
   done
   load_profile "$name"
-  current="$(active_name 2>/dev/null || true)"
 
   case "$PROFILE_TYPE" in
     oauth_token)
       token="$(keychain_get "$KEYCHAIN_SERVICE")" || die "token missing from Keychain: $KEYCHAIN_SERVICE"
-      validate_token "$token" || { unset token; die "OAuth for profile '$name' was rejected"; }
-      refresh_archive_of_active_native
+      auth_json="$(CLAUDE_CODE_OAUTH_TOKEN="$token" "$NATIVE_BIN" auth status)"
+      [ "$(printf '%s' "$auth_json" | jq -r '.loggedIn // false')" = true ] || die "OAuth for profile '$name' was rejected"
+
+      # If a native login is active, preserve it before removing the fallback.
+      if keychain_has "$NATIVE_SERVICE"; then
+        primary_archive="Claude Code-credentials-primary-archive"
+        archive_native_if_present "$primary_archive"
+        if [ ! -f "$(profile_file primary)" ]; then
+          write_profile primary native_archive "$primary_archive" "primary (native login)"
+        fi
+      fi
+      remove_native_active
       launchctl setenv CLAUDE_CODE_OAUTH_TOKEN "$token"
-      unset token
+      strip_stale_account_metadata
+      unset token auth_json
       ;;
     native_archive)
-      refresh_archive_of_active_native
-      if keychain_has "$NATIVE_SERVICE"; then
-        live="$(fingerprint "$(keychain_get "$NATIVE_SERVICE")")"
-        want="$(fingerprint "$(keychain_get "$KEYCHAIN_SERVICE" || true)")"
-        if [ "$live" != "$want" ]; then
-          # Another native account owns the slot: archive it under its own
-          # profile (done above) and put the requested one in.
-          restore_native_active "$KEYCHAIN_SERVICE"
-        fi
-      else
-        restore_native_active "$KEYCHAIN_SERVICE"
-      fi
       launchctl unsetenv CLAUDE_CODE_OAUTH_TOKEN >/dev/null 2>&1 || true
+      restore_native_active "$KEYCHAIN_SERVICE"
       ;;
   esac
 
   set_active "$name"
-  [ "$stop_daemon" = true ] && stop_claude_daemon
-  if [ "$current" = "$name" ]; then
-    note "active profile: $name ($PROFILE_TYPE), unchanged"
-  else
-    note "active profile: $name ($PROFILE_TYPE); new claude processes use it, running ones keep '${current:-none}'"
-  fi
+  stop_claude_daemon
+  note "active profile: $name ($PROFILE_TYPE)"
+  if [ "$restart" = true ]; then schedule_orca_restart; fi
 }
 
 cmd_list() {
@@ -312,7 +332,7 @@ cmd_status() {
   else
     printf 'launchctl_oauth=absent\n'
   fi
-  keychain_has "$NATIVE_SERVICE" && echo 'native_login=present' || echo 'native_login=absent'
+  keychain_has "$NATIVE_SERVICE" && echo 'native_fallback=present' || echo 'native_fallback=absent'
   unset secret launch_value
 }
 
@@ -337,7 +357,9 @@ cmd_doctor() {
       echo '[FAIL] launchctl diverges from the active profile'; failures=$((failures + 1))
     fi
     if keychain_has "$NATIVE_SERVICE"; then
-      echo '[ok] native login kept in place (env var wins; running native sessions keep working)'
+      echo '[FAIL] a stale native login is still active (it shadows the setup-token)'; failures=$((failures + 1))
+    else
+      echo '[ok] native fallback is blocked'
     fi
   else
     if [ -n "$launch_value" ]; then
@@ -478,7 +500,7 @@ Usage:
                                                     (--existing: Keychain item already stored)
   claude-account add-oauth <name> --measure-for <p> use this token only to measure profile <p>
   claude-account import-native [name]               import the current native login as a profile
-  claude-account use <name> [--stop-daemon]         switch the active profile (never kills anything)
+  claude-account use <name> [--restart-orca|--no-restart]  switch every auth layer (restarts Orca if installed)
   claude-account list
   claude-account status
   claude-account doctor

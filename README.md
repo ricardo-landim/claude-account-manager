@@ -92,9 +92,10 @@ claude-account use personal
 ```
 
 > [!NOTE]
-> `use` never kills anything. New `claude` processes pick the active profile up on their own;
-> sessions already running keep the account they started with (the token rides in their
-> environment from birth). Pass `--stop-daemon` if you also want the Claude daemon restarted.
+> `use` restarts [Orca](https://orca.dev) (if installed) so live processes switch too; pass
+> `--no-restart` to skip. New shells always pick up the active profile; already-open sessions
+> keep the previous account until restarted. The headless switcher (`claude-account-autoswitch`)
+> always passes `--no-restart`.
 
 ## Commands
 
@@ -220,11 +221,11 @@ it does not). Unusual install location? Point at it with `CLAUDE_NATIVE_BIN=/pat
 
 - Tokens are validated against `claude auth status` before being stored.
 - `status` and `doctor` print SHA-256 fingerprints, never secrets.
-- The native credential is never deleted from the live slot; before anything displaces it, the
-  archive of the profile that owns it is refreshed, so a rotated refresh token is never lost.
-- No process is ever killed by a switch. The old `lib/restart-orca.sh` helper is kept in the repo
-  for reference only and the installer no longer installs it (it sent SIGTERM to every `claude`
-  process, which kills background jobs and workers).
+- Every removal from the active Keychain slot is preceded by an archive copy, verified by
+  fingerprint.
+- `~/.claude.json` account metadata is backed up before being stripped.
+- On machines without Orca, the restart helper is skipped entirely and nothing is killed; the
+  headless switcher never restarts Orca.
 - `measure` spends one output token per profile per run and prints fingerprints only.
 
 ## Docs
