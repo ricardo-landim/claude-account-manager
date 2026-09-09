@@ -24,10 +24,13 @@ install -m 700 "$ROOT/bin/claude-account-regime" "$BIN/claude-account-regime"
 install -m 700 "$ROOT/bin/claude" "$BIN/claude"
 install -m 600 "$ROOT/lib/shell-init.zsh" "$LIB/shell-init.zsh"
 
-# The restart-orca helper is no longer installed: it sent SIGTERM to every
-# `claude` process, which kills background jobs and workers. New sessions pick
-# the active profile up on their own; nothing running is ever touched.
-rm -f "$LIB/restart-orca.sh"
+if [ -d "/Applications/Orca.app" ] || [ -d "$HOME/Applications/Orca.app" ]; then
+  install -m 700 "$ROOT/lib/restart-orca.sh" "$LIB/restart-orca.sh"
+  echo "Orca detected: restart helper installed."
+else
+  rm -f "$LIB/restart-orca.sh"
+  echo "Orca not detected: restart helper skipped. After switching accounts, restart your terminal sessions."
+fi
 
 echo "Installed: $BIN/claude-account, $BIN/claude-account-regime, $BIN/claude-account-autoswitch, $BIN/claude (wrapper)."
 echo

@@ -92,9 +92,10 @@ claude-account use pessoal
 ```
 
 > [!NOTE]
-> O `use` nunca derruba nada. Processos `claude` novos pegam o perfil ativo sozinhos; sessões já
-> abertas seguem na conta em que nasceram (o token vai no ambiente delas desde o início). Passe
-> `--stop-daemon` se quiser reiniciar também o daemon do Claude.
+> O `use` reinicia o [Orca](https://orca.dev) (se instalado) para que os processos vivos também
+> troquem; passe `--no-restart` para pular. Shells novos sempre pegam o perfil ativo; sessões já
+> abertas seguem na conta anterior até reiniciar. O trocador automático
+> (`claude-account-autoswitch`) sempre passa `--no-restart`.
 
 ## Comandos
 
@@ -220,11 +221,11 @@ vier). Instalação em lugar incomum? Aponte com `CLAUDE_NATIVE_BIN=/path/to/cla
 
 - Tokens são validados contra `claude auth status` antes de serem guardados.
 - `status` e `doctor` imprimem fingerprints SHA-256, nunca segredos.
-- A credencial nativa nunca é apagada do slot vivo; antes de qualquer coisa deslocá-la, o arquivo
-  do perfil dono dela é atualizado, então um refresh token rotacionado nunca se perde.
-- Nenhum processo é derrubado numa troca. O antigo `lib/restart-orca.sh` fica no repo só como
-  referência e o instalador não o instala mais (ele mandava SIGTERM pra todo processo `claude`,
-  o que mata jobs em segundo plano e workers).
+- Toda remoção do slot ativo do Keychain é precedida de uma cópia de arquivo, verificada por
+  fingerprint.
+- Os metadados de conta em `~/.claude.json` recebem backup antes de serem removidos.
+- Em máquinas sem Orca, o helper de reinício é pulado por inteiro e nada é derrubado; o trocador
+  automático nunca reinicia o Orca.
 - `measure` gasta um token de saída por perfil por rodada e imprime só fingerprints.
 
 ## Docs
