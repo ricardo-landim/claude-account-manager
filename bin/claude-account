@@ -177,12 +177,37 @@ access_fingerprint_of() {
 
 live_native_access_fingerprint() { access_fingerprint_of "$NATIVE_SERVICE"; }
 
+# A setup-token lives one year. Its birth is read from the Keychain item's modification date
+# (`add-oauth` rewrites the item with -U, which keeps the creation date but moves this one), so the
+# projection can carry the token's real expiry. The daemon behind `claude agents` refreshes a
+# credential only when its expiry is near, and with no refresh token that refresh fails and the
+# daemon drops the credential: an expiry earlier than the token's would break the agents while the
+# token still works (measured on 2.1.267: the daemon log reads "proactive refresh failed,
+# signalling re-auth required"). A plain session ignores the expiry when there is no refresh token.
+TOKEN_LIFETIME_DAYS=364
+PROJECTION_FALLBACK_DAYS=330
+
+keychain_written_epoch() {
+  stamp="$(security find-generic-password -a "$USER" -s "$1" 2>/dev/null \
+    | sed -n 's/.*"mdat"<timedate>=[^"]*"\([0-9]\{14\}\)Z.*/\1/p' | head -1)"
+  [ -n "$stamp" ] || return 1
+  date -j -u -f '%Y%m%d%H%M%S' "$stamp" +%s 2>/dev/null
+}
+
+# Epoch seconds when the setup-token in this Keychain item stops working.
+token_expiry_epoch() {
+  if created="$(keychain_written_epoch "$1")"; then
+    printf '%s\n' $(( created + TOKEN_LIFETIME_DAYS * 86400 ))
+  else
+    printf '%s\n' $(( $(date +%s) + PROJECTION_FALLBACK_DAYS * 86400 ))
+  fi
+}
+
 # Writes an OAuth profile into the live slot as a native-shaped credential: the setup-token
 # as access token, no refresh token (a setup-token is long-lived and has nothing to refresh
-# with) and an expiry the CLI never reaches, so it never tries to refresh it.
-PROJECTION_DAYS=330
+# with) and the token's own expiry, so the daemon never tries to refresh it before it dies.
 project_token_into_native() {
-  expires=$(( ( $(date +%s) + PROJECTION_DAYS * 86400 ) * 1000 ))
+  expires=$(( $(token_expiry_epoch "$KEYCHAIN_SERVICE") * 1000 ))
   base="$(live_native_blob)"
   printf '%s' "$base" | jq -e 'type == "object"' >/dev/null 2>&1 || base='{}'
   blob="$(printf '%s' "$base" | CA_TOKEN="$1" jq -c --argjson e "$expires" --arg s "$PROFILE_SUBSCRIPTION" \
@@ -454,6 +479,29 @@ check_open_sessions() {
   fi
 }
 
+# A setup-token dies a year after it was made, and nothing refreshes it. Warn 30 days ahead, per
+# OAuth profile, with the way out; a dead one is a failure because every switch to it breaks.
+check_token_expiry() {
+  now="$(date +%s)"
+  for file in "$PROFILES_DIR"/*.json; do
+    [ -f "$file" ] || continue
+    [ "$(jq -r '.type' "$file")" = oauth_token ] || continue
+    pname="$(jq -r '.name' "$file")"
+    psvc="$(jq -r '.keychainService' "$file")"
+    created="$(keychain_written_epoch "$psvc")" || { echo "[warn] setup-token of '$pname': write date unreadable, expiry unknown"; continue; }
+    ends=$(( created + TOKEN_LIFETIME_DAYS * 86400 ))
+    left=$(( (ends - now) / 86400 ))
+    day="$(date -r "$ends" +%Y-%m-%d)"
+    if [ "$left" -lt 0 ]; then
+      echo "[FAIL] setup-token of '$pname' expired around $day (claude setup-token, then: claude-account add-oauth $pname)"; failures=$((failures + 1))
+    elif [ "$left" -le 30 ]; then
+      echo "[warn] setup-token of '$pname' expires around $day, in $left day(s) (claude setup-token, then: claude-account add-oauth $pname)"
+    else
+      echo "[ok] setup-token of '$pname' valid until about $day"
+    fi
+  done
+}
+
 cmd_doctor() {
   failures=0
   active="$(active_name 2>/dev/null || true)"
@@ -506,6 +554,7 @@ cmd_doctor() {
   want=""
   if [ "$PROFILE_TYPE" = oauth_token ] && [ -n "${secret:-}" ]; then want="$(fingerprint "$secret")"; fi
   check_open_sessions "$want" "$active"
+  check_token_expiry
   if [ -x "$WRAPPER_BIN" ]; then
     echo '[ok] claude wrapper installed'
   else
