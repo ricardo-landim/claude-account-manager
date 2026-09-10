@@ -3,9 +3,11 @@
 # Secrets live exclusively in the macOS Keychain; this file never contains tokens.
 #
 # `use <name>` switches every auth layer atomically (Keychain slots, launchctl,
-# ~/.claude.json metadata, Claude daemon) and, when Orca is installed, restarts
-# it so live processes switch too; `--no-restart` skips the restart. The
-# headless switcher (claude-account-autoswitch) always passes `--no-restart`.
+# ~/.claude.json metadata, Claude daemon). An OAuth profile is also projected into
+# the native Keychain slot, which is where `claude agents` and background sessions
+# read their credential. By default the daemon restarts and, when Orca is
+# installed, Orca too; `--no-restart` stops nothing. The headless switcher
+# (claude-account-autoswitch) always passes `--no-restart`.
 #
 # `measure` reads the real rate-limit state of every profile from the
 # anthropic-ratelimit-unified-* headers (a setup-token has inference scope only,
@@ -83,6 +85,7 @@ load_profile() {
   KEYCHAIN_SERVICE="$(jq -er '.keychainService' "$PROFILE_FILE")"
   PROFILE_LABEL="$(jq -r '.label // .name' "$PROFILE_FILE")"
   MEASURE_SERVICE="$(jq -r '.measureKeychainService // empty' "$PROFILE_FILE")"
+  PROFILE_SUBSCRIPTION="$(jq -r '.subscription // "max"' "$PROFILE_FILE")"
   case "$PROFILE_TYPE" in
     oauth_token|native_archive) ;;
     *) die "unknown profile type in $PROFILE_FILE: $PROFILE_TYPE" ;;
@@ -129,45 +132,119 @@ write_profile() {
   mv "$tmp" "$file"
 }
 
+# Copies one Keychain item into another, verified by fingerprint.
+copy_keychain_item() {
+  from="$1" to="$2"
+  blob="$(keychain_get "$from")" || die "Keychain item missing: $from"
+  security add-generic-password -U -a "$USER" -s "$to" -w "$blob" >/dev/null
+  check="$(keychain_get "$to")"
+  [ "$(fingerprint "$blob")" = "$(fingerprint "$check")" ] || die "copied credential does not match: $to"
+  unset blob check
+}
+
 # Copies the live native credential into an archive slot, verified by fingerprint.
 archive_native_if_present() {
-  archive_service="$1"
-  if keychain_has "$NATIVE_SERVICE"; then
-    blob="$(keychain_get "$NATIVE_SERVICE")"
-    security add-generic-password -U -a "$USER" -s "$archive_service" -w "$blob" >/dev/null
-    check="$(keychain_get "$archive_service")"
-    [ "$(fingerprint "$blob")" = "$(fingerprint "$check")" ] || die "archived native credential does not match"
-    unset blob check
+  if keychain_has "$NATIVE_SERVICE"; then copy_keychain_item "$NATIVE_SERVICE" "$1"; fi
+}
+
+# The live native slot is the one credential every Claude Code process reads alike. The
+# daemon behind `claude agents` and the background sessions it spawns do not inherit
+# CLAUDE_CODE_OAUTH_TOKEN from the shell: they authenticate from this slot. Besides the
+# account login the blob carries other keys (MCP server OAuth lives there), and every
+# write below keeps them.
+live_native_blob() { keychain_get "$NATIVE_SERVICE" || true; }
+
+# absent | login (a real /login, with a refresh token) | token (a projected setup-token) | other
+live_native_kind() {
+  kind_blob="$(live_native_blob)"
+  if [ -z "$kind_blob" ]; then
+    echo absent
+  else
+    printf '%s' "$kind_blob" | jq -r '
+      if type != "object" or (.claudeAiOauth | type) != "object" then "other"
+      elif (.claudeAiOauth.refreshToken // "") != "" then "login"
+      else "token" end' 2>/dev/null || echo other
   fi
+  unset kind_blob
 }
 
-restore_native_active() {
-  archive_service="$1"
-  blob="$(keychain_get "$archive_service")" || die "native archive missing from Keychain"
+access_fingerprint_of() {
+  access="$(keychain_get "$1" | jq -r '.claudeAiOauth.accessToken // empty' 2>/dev/null || true)"
+  [ -n "$access" ] || { unset access; return 1; }
+  fingerprint "$access"
+  unset access
+}
+
+live_native_access_fingerprint() { access_fingerprint_of "$NATIVE_SERVICE"; }
+
+# Writes an OAuth profile into the live slot as a native-shaped credential: the setup-token
+# as access token, no refresh token (a setup-token is long-lived and has nothing to refresh
+# with) and an expiry the CLI never reaches, so it never tries to refresh it.
+PROJECTION_DAYS=330
+project_token_into_native() {
+  expires=$(( ( $(date +%s) + PROJECTION_DAYS * 86400 ) * 1000 ))
+  base="$(live_native_blob)"
+  printf '%s' "$base" | jq -e 'type == "object"' >/dev/null 2>&1 || base='{}'
+  blob="$(printf '%s' "$base" | CA_TOKEN="$1" jq -c --argjson e "$expires" --arg s "$PROFILE_SUBSCRIPTION" \
+    '.claudeAiOauth = {accessToken: env.CA_TOKEN, refreshToken: null, expiresAt: $e,
+                       scopes: ["user:inference"], subscriptionType: $s}')"
   security add-generic-password -U -a "$USER" -s "$NATIVE_SERVICE" -w "$blob" >/dev/null
-  unset blob
+  unset base blob
+  [ "$(live_native_access_fingerprint || true)" = "$(fingerprint "$1")" ] || \
+    die "projected credential does not match the profile token"
 }
 
-# The native login refreshes its own tokens while it sits in the live slot. Before
-# anything displaces it, the archive of the profile that owns it is refreshed, so a
-# rotated refresh token is never lost (the first release restored a stale copy here).
-refresh_archive_of_active_native() {
+# Restores an archived login into the live slot, keeping the other keys of the live blob.
+restore_native_active() {
+  blob="$(keychain_get "$1")" || die "native archive missing from Keychain"
+  live="$(live_native_blob)"
+  if printf '%s' "$live" | jq -e 'type == "object"' >/dev/null 2>&1; then
+    blob="$(printf '%s\n%s\n' "$blob" "$live" | jq -cs '.[0] + (.[1] | del(.claudeAiOauth))')"
+  fi
+  security add-generic-password -U -a "$USER" -s "$NATIVE_SERVICE" -w "$blob" >/dev/null
+  unset blob live
+}
+
+LAST_LOGIN_ARCHIVE="Claude Code-credentials-last-login-archive"
+
+# A real /login in the live slot is never lost. When the active profile is native it owns
+# the slot, and its archive is refreshed (the login rotates its refresh token while it sits
+# there). Otherwise the login came from a /login inside Claude Code: it is kept in a
+# last-login archive that `import-native <name> --last-login` turns into a profile.
+preserve_live_login() {
+  [ "$(live_native_kind)" = login ] || return 0
   current="$(active_name 2>/dev/null || true)"
-  [ -n "$current" ] || return 0
-  [ -f "$(profile_file "$current")" ] || return 0
-  ctype="$(jq -r '.type' "$(profile_file "$current")")"
-  [ "$ctype" = native_archive ] || return 0
-  cservice="$(jq -r '.keychainService' "$(profile_file "$current")")"
-  archive_native_if_present "$cservice"
+  if [ -n "$current" ] && [ -f "$(profile_file "$current")" ] && \
+     [ "$(jq -r '.type' "$(profile_file "$current")")" = native_archive ]; then
+    archive_native_if_present "$(jq -r '.keychainService' "$(profile_file "$current")")"
+    return 0
+  fi
+  archive_native_if_present "$LAST_LOGIN_ARCHIVE"
+  note "a /login found in the native slot was kept as '$LAST_LOGIN_ARCHIVE' (claude-account import-native <name> --last-login)"
 }
 
-stop_claude_daemon() {
-  "$NATIVE_BIN" daemon stop --any >/dev/null 2>&1 || true
+# True when the caller descends from the Claude daemon (a background agent running us):
+# a full daemon stop would terminate the caller itself.
+inside_background_agent() {
+  pid=$$
+  while [ -n "$pid" ] && [ "$pid" -gt 1 ]; do
+    case "$(ps -o command= -p "$pid" 2>/dev/null || true)" in
+      *"daemon run"*|*bg-pty-host*) return 0 ;;
+    esac
+    pid="$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ' || true)"
+  done
+  return 1
 }
 
-remove_native_active() {
-  if keychain_has "$NATIVE_SERVICE"; then
-    security delete-generic-password -a "$USER" -s "$NATIVE_SERVICE" >/dev/null
+# New background agents start from the slot the daemon hands them. A full stop ends every
+# running agent; --keep-workers (for --keep-agents, and whenever we run inside an agent)
+# keeps them alive on the account they started with.
+restart_claude_daemon() {
+  if [ "$1" = true ] || inside_background_agent; then
+    "$NATIVE_BIN" daemon stop --any --keep-workers >/dev/null 2>&1 || true
+    note "daemon restarted; running agents keep their account until respawned (claude respawn)"
+  else
+    "$NATIVE_BIN" daemon stop --any >/dev/null 2>&1 || true
   fi
 }
 
@@ -246,11 +323,22 @@ cmd_add_oauth() {
 
 cmd_import_native() {
   name="${1:-primary}"
+  shift || true
   validate_name "$name"
-  keychain_has "$NATIVE_SERVICE" || die "no active native credential to import"
+  from="$NATIVE_SERVICE"
+  case "${1:-}" in
+    '') ;;
+    --last-login) from="$LAST_LOGIN_ARCHIVE" ;;
+    *) usage_error "unknown option: $1" ;;
+  esac
+  keychain_get "$from" | jq -e '(.claudeAiOauth.refreshToken // "") != ""' >/dev/null 2>&1 || \
+    die "'$from' holds no /login (only a projected setup-token or MCP keys); log in with /login first"
   service="Claude Code-credentials-$name-archive"
-  archive_native_if_present "$service"
-  email="$(CLAUDE_CODE_OAUTH_TOKEN='' "$NATIVE_BIN" auth status 2>/dev/null | jq -r '.email // empty' || true)"
+  copy_keychain_item "$from" "$service"
+  email=""
+  if [ "$from" = "$NATIVE_SERVICE" ]; then
+    email="$(CLAUDE_CODE_OAUTH_TOKEN='' "$NATIVE_BIN" auth status 2>/dev/null | jq -r '.email // empty' || true)"
+  fi
   write_profile "$name" native_archive "$service" "$name (native login${email:+ $email})"
   note "native credential imported as profile '$name'${email:+ ($email)}"
 }
@@ -259,34 +347,37 @@ cmd_use() {
   name="${1:-}"
   shift || true
   restart=true
+  keep_agents=false
   while [ "$#" -gt 0 ]; do
     case "$1" in
       --restart-orca) restart=true ;;
       --no-restart) restart=false ;;
+      --keep-agents) keep_agents=true ;;
       *) usage_error "unknown option: $1" ;;
     esac
     shift
   done
   load_profile "$name"
 
+  # Validate before touching any layer.
   case "$PROFILE_TYPE" in
     oauth_token)
       token="$(keychain_get "$KEYCHAIN_SERVICE")" || die "token missing from Keychain: $KEYCHAIN_SERVICE"
-      auth_json="$(CLAUDE_CODE_OAUTH_TOKEN="$token" "$NATIVE_BIN" auth status)"
-      [ "$(printf '%s' "$auth_json" | jq -r '.loggedIn // false')" = true ] || die "OAuth for profile '$name' was rejected"
+      validate_token "$token" || { unset token; die "OAuth for profile '$name' was rejected"; }
+      ;;
+    native_archive)
+      keychain_get "$KEYCHAIN_SERVICE" | jq -e '(.claudeAiOauth.refreshToken // "") != ""' >/dev/null 2>&1 || \
+        die "the archive of profile '$name' holds no /login; log in with /login, then: claude-account import-native $name"
+      ;;
+  esac
 
-      # If a native login is active, preserve it before removing the fallback.
-      if keychain_has "$NATIVE_SERVICE"; then
-        primary_archive="Claude Code-credentials-primary-archive"
-        archive_native_if_present "$primary_archive"
-        if [ ! -f "$(profile_file primary)" ]; then
-          write_profile primary native_archive "$primary_archive" "primary (native login)"
-        fi
-      fi
-      remove_native_active
+  preserve_live_login
+  case "$PROFILE_TYPE" in
+    oauth_token)
+      project_token_into_native "$token"
       launchctl setenv CLAUDE_CODE_OAUTH_TOKEN "$token"
       strip_stale_account_metadata
-      unset token auth_json
+      unset token
       ;;
     native_archive)
       launchctl unsetenv CLAUDE_CODE_OAUTH_TOKEN >/dev/null 2>&1 || true
@@ -295,9 +386,13 @@ cmd_use() {
   esac
 
   set_active "$name"
-  stop_claude_daemon
   note "active profile: $name ($PROFILE_TYPE)"
-  if [ "$restart" = true ]; then schedule_orca_restart; fi
+  if [ "$restart" = true ]; then
+    restart_claude_daemon "$keep_agents"
+    schedule_orca_restart
+  else
+    note "--no-restart: nothing was stopped; new sessions use '$name', open sessions and running agents keep their account until restarted"
+  fi
 }
 
 cmd_list() {
@@ -332,8 +427,31 @@ cmd_status() {
   else
     printf 'launchctl_oauth=absent\n'
   fi
-  keychain_has "$NATIVE_SERVICE" && echo 'native_fallback=present' || echo 'native_fallback=absent'
+  printf 'native_slot=%s\n' "$(live_native_kind)"
+  if live_fp="$(live_native_access_fingerprint)"; then printf 'native_fingerprint=%s\n' "$live_fp"; fi
   unset secret launch_value
+}
+
+# Interactive sessions keep the token they were opened with in their environment, so a
+# switch reaches them only when they restart. Processes with their own CLAUDE_CONFIG_DIR
+# (services with a dedicated credential) are not managed here and are skipped.
+check_open_sessions() {
+  want="$1" active="$2" total=0 off=0 pids=""
+  while IFS= read -r line; do
+    case " $line " in *" CLAUDE_CONFIG_DIR="*) continue ;; esac
+    tok="$(printf '%s\n' "$line" | tr ' ' '\n' | sed -n 's/^CLAUDE_CODE_OAUTH_TOKEN=//p' | head -1)"
+    [ -n "$tok" ] || continue
+    total=$((total + 1))
+    if [ "$(fingerprint "$tok")" != "$want" ]; then off=$((off + 1)); pids="$pids ${line%% *}"; fi
+  done < <(ps -wwE -U "$(id -u)" -o pid=,command= 2>/dev/null | \
+             awk '{sub(/^ +/, ""); c = $2; n = split(c, p, "/");
+                   if (p[n] == "claude" || c ~ /\/claude\/versions\/[0-9.]+$/) print}' || true)
+  unset tok line
+  if [ "$off" -gt 0 ]; then
+    echo "[warn] $off of $total open session(s) run on another account (pid$pids): restart them to use '$active'"
+  else
+    echo "[ok] $total open session(s) with an env token, all on '$active'"
+  fi
 }
 
 cmd_doctor() {
@@ -356,10 +474,17 @@ cmd_doctor() {
     else
       echo '[FAIL] launchctl diverges from the active profile'; failures=$((failures + 1))
     fi
-    if keychain_has "$NATIVE_SERVICE"; then
-      echo '[FAIL] a stale native login is still active (it shadows the setup-token)'; failures=$((failures + 1))
+    kind="$(live_native_kind)"
+    if [ "$kind" = token ] && [ -n "${secret:-}" ] && \
+       [ "$(live_native_access_fingerprint || true)" = "$(fingerprint "$secret")" ]; then
+      echo '[ok] native slot carries the active profile token (daemon and background agents on the same account)'
     else
-      echo '[ok] native fallback is blocked'
+      case "$kind" in
+        login) why='a /login sits in the native slot: background agents run on that account' ;;
+        absent) why='the native slot is empty: background agents have no credential' ;;
+        *) why='the native slot carries another credential: background agents run on another account' ;;
+      esac
+      echo "[FAIL] $why, not on '$active' (fix: claude-account use $active)"; failures=$((failures + 1))
     fi
   else
     if [ -n "$launch_value" ]; then
@@ -368,8 +493,8 @@ cmd_doctor() {
       echo '[ok] launchctl carries no OAuth token'
     fi
     if keychain_has "$NATIVE_SERVICE"; then
-      live="$(fingerprint "$(keychain_get "$NATIVE_SERVICE")")"
-      if [ -n "${secret:-}" ] && [ "$live" = "$(fingerprint "$secret")" ]; then
+      live="$(live_native_access_fingerprint || true)"
+      if [ -n "$live" ] && [ "$live" = "$(access_fingerprint_of "$KEYCHAIN_SERVICE" || true)" ]; then
         echo '[ok] native credential in the live slot matches the profile archive'
       else
         echo '[warn] live native credential differs from the archive (tokens refreshed since import; run `use` on this profile to re-archive)'
@@ -378,6 +503,9 @@ cmd_doctor() {
       echo '[FAIL] active native credential missing'; failures=$((failures + 1))
     fi
   fi
+  want=""
+  if [ "$PROFILE_TYPE" = oauth_token ] && [ -n "${secret:-}" ]; then want="$(fingerprint "$secret")"; fi
+  check_open_sessions "$want" "$active"
   if [ -x "$WRAPPER_BIN" ]; then
     echo '[ok] claude wrapper installed'
   else
@@ -499,8 +627,11 @@ Usage:
   claude-account add-oauth <name> [--existing]      register a profile from a setup-token
                                                     (--existing: Keychain item already stored)
   claude-account add-oauth <name> --measure-for <p> use this token only to measure profile <p>
-  claude-account import-native [name]               import the current native login as a profile
-  claude-account use <name> [--restart-orca|--no-restart]  switch every auth layer (restarts Orca if installed)
+  claude-account import-native [name] [--last-login] import the current /login (or the last one
+                                                    displaced by `use`) as a profile
+  claude-account use <name> [--no-restart|--keep-agents]  switch every auth layer, the native slot
+                                                    included; restarts the daemon (and Orca if
+                                                    installed). --keep-agents keeps running agents
   claude-account list
   claude-account status
   claude-account doctor
