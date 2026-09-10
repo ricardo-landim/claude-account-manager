@@ -27,9 +27,11 @@ while [ $# -gt 0 ]; do
 done
 f="$STUB_KC/$(printf %s "$svc" | shasum | cut -c1-16)"
 case "$op" in
-  find-generic-password) [ -f "$f" ] || exit 44; if $want; then cat "$f"; fi ;;
-  add-generic-password) printf %s "$val" > "$f" ;;
-  delete-generic-password) [ -f "$f" ] || exit 44; rm -f "$f" ;;
+  find-generic-password)
+    [ -f "$f" ] || exit 44
+    if $want; then cat "$f"; else printf '    "mdat"<timedate>=0x00  "%sZ\\000"\n' "$(cat "$f.mdat")"; fi ;;
+  add-generic-password) printf %s "$val" > "$f"; date -u +%Y%m%d%H%M%S > "$f.mdat" ;;
+  delete-generic-password) [ -f "$f" ] || exit 44; rm -f "$f" "$f.mdat" ;;
 esac
 EOF
 cat > "$S/launchctl" <<'EOF'
@@ -133,6 +135,22 @@ check "import-native refuses a projected setup-token" 1 "$rc"
 ca import-native saved --last-login >/dev/null
 check "import-native --last-login creates the profile" "native_archive" "$(jq -r .type "$W/cfg/profiles/saved.json")"
 check "import-native --last-login copies the stray /login" "L1" "$(kc_get 'Claude Code-credentials-saved-archive' | jq -r .claudeAiOauth.accessToken)"
+
+# A setup-token lives one year from when it was written: the projection carries that expiry, so the
+# daemon never refreshes (and drops) a credential that still works, and doctor warns 30 days ahead.
+kc_set_written() { printf '%s\n' "$2" > "$STUB_KC/$(printf %s "$1" | shasum | cut -c1-16).mdat"; }
+ca use work --no-restart >/dev/null
+written="$(date -j -u -f '%Y%m%d%H%M%S' "$(cat "$STUB_KC/$(printf %s 'Claude Code OAuth Token - work' | shasum | cut -c1-16).mdat")" +%s)"
+check "projection expires one year after the token was written" "$(( (written + 364 * 86400) * 1000 ))" "$(live .claudeAiOauth.expiresAt)"
+check "doctor reports a fresh token as valid" 1 "$(ca doctor | grep -c "\[ok\] setup-token of 'work' valid until about")"
+kc_set_written "Claude Code OAuth Token - home" "$(date -u -v-340d +%Y%m%d%H%M%S)"
+check "doctor warns 30 days before the token dies" 1 "$(ca doctor | grep -c "\[warn\] setup-token of 'home' expires around")"
+kc_set_written "Claude Code OAuth Token - home" "$(date -u -v-400d +%Y%m%d%H%M%S)"
+set +e
+out="$(ca doctor)"; rc=$?
+set -e
+check "doctor fails on an expired token" 1 "$(printf '%s' "$out" | grep -c "\[FAIL\] setup-token of 'home' expired around")"
+check "an expired token fails the doctor" 1 "$rc"
 
 printf '%d/%d passed\n' "$((runs - fails))" "$runs"
 [ "$fails" -eq 0 ]
