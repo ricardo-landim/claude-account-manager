@@ -32,7 +32,7 @@ produto:      trocador multi-conta do Claude Code no macOS
 contas:       perfis nomeados — setup-token OAuth ou /login nativo
 cofre:        só o Keychain do macOS (zero segredo em dotfile, JSON ou log)
 troca:        claude-account use <nome> — atômica em todas as camadas
-camadas:      slots do Keychain · launchctl · ~/.claude.json · daemon · shells
+camadas:      slots do Keychain · slot nativo (agents) · launchctl · ~/.claude.json · daemon · shells
 segurança:    credencial deslocada é arquivada antes, verificada por fingerprint
 diagnóstico:  doctor · status · probe (fingerprints SHA-256, nunca segredos)
 extras:       medição de rate limit · troca automática · regime de cota · override CLAUDE_NATIVE_BIN
@@ -49,6 +49,11 @@ A armadilha clássica: você parte de um setup-token, faz `/login` numa segunda 
 consegue voltar pro token sem reiniciar a máquina, porque a credencial nativa que o `/login`
 gravou no Keychain sombreia o token.
 
+A segunda armadilha é o `claude agents`. O daemon por trás dele não repassa o
+`CLAUDE_CODE_OAUTH_TOKEN` às sessões em segundo plano que cria, então elas autenticam só pelo slot
+nativo do Keychain. Com o token só no shell, o terminal roda numa conta e cada agent de fundo no que
+estiver no slot, ou em nada. Por isso o `use` também projeta o setup-token ativo nesse slot.
+
 ## Arquitetura
 
 ```
@@ -56,14 +61,14 @@ gravou no Keychain sombreia o token.
                               │
       claude (wrapper) ──▶ exec sob o perfil ativo ──▶ binário claude real
                               │
-        ┌─────────────────────┼─────────────────────────┐
-        ▼                     ▼                         ▼
-  Keychain do macOS      launchctl env             ~/.claude.json
-  slots por perfil   CLAUDE_CODE_OAUTH_TOKEN     metadado de conta
-        └─────────────────────┴─────────────────────────┘
+        ┌──────────────────┬──┴──────────────────┬──────────────────┐
+        ▼                  ▼                     ▼                  ▼
+  Keychain do macOS   slot nativo          launchctl env      ~/.claude.json
+  slots por perfil (daemon, claude agents) CLAUDE_CODE_OAUTH_TOKEN metadado de conta
+        └──────────────────┴─────────────────────┴──────────────────┘
                               │
         claude-account use <nome>  = troca TODAS atomicamente,
-        arquivando o que remove (a troca nunca destrói um login)
+        arquivando todo login que desloca (a troca nunca destrói um login)
 ```
 
 ## Quick start
@@ -92,9 +97,11 @@ claude-account use pessoal
 ```
 
 > [!NOTE]
-> O `use` reinicia o [Orca](https://orca.dev) (se instalado) para que os processos vivos também
-> troquem; passe `--no-restart` para pular. Shells novos sempre pegam o perfil ativo; sessões já
-> abertas seguem na conta anterior até reiniciar. O trocador automático
+> O `use` reinicia o daemon do Claude e o [Orca](https://orca.dev) (se instalado) para que os
+> processos vivos também troquem. `--keep-agents` mantém vivos os agents de fundo em execução, na
+> conta em que nasceram (é automático quando o `use` roda de dentro de um agent, que uma parada
+> completa encerraria); `--no-restart` não para nada. Shells novos e agents novos sempre pegam o
+> perfil ativo; sessões já abertas seguem na conta anterior até reiniciar. O trocador automático
 > (`claude-account-autoswitch`) sempre passa `--no-restart`.
 
 ## Comandos
@@ -102,8 +109,8 @@ claude-account use pessoal
 | | Comando | O que faz |
 |:---:|---|---|
 | ➕ | `add-oauth <nome>` | registra um perfil por setup-token (validado antes de guardar) |
-| 📥 | `import-native [nome]` | importa a credencial do `/login` atual como perfil |
-| 🔁 | `use <nome>` | troca todas as camadas de auth pro perfil, atomicamente |
+| 📥 | `import-native [nome] [--last-login]` | importa o `/login` atual (ou o último que o `use` deslocou) como perfil |
+| 🔁 | `use <nome>` | troca todas as camadas de auth pro perfil, atomicamente, slot nativo incluído |
 | 📋 | `list` | perfis, o ativo marcado com `*` |
 | 🩺 | `doctor` | checa divergência em todas as camadas |
 | 📊 | `status` | perfil ativo + fingerprints (nunca os segredos) |
@@ -197,15 +204,17 @@ semana inteira. Testes de cenário offline: `tests/regime-scenarios.sh`.
 > `/login` dentro do Claude Code. Um `/login` direto grava uma credencial nativa que sombreia o
 > perfil de setup-token ativo, e o estado diverge em silêncio.
 
-Se acontecer mesmo assim, o `doctor` pega:
+Se acontecer mesmo assim, o `doctor` pega, porque os agents de fundo rodariam naquele login:
 
 ```
-[FAIL] launchctl diverges from the active profile
+[FAIL] a /login sits in the native slot: background agents run on that account, not on 'trabalho' (fix: claude-account use trabalho)
+[warn] 1 of 3 open session(s) run on another account (pid 51821): restart them to use 'trabalho'
 ```
 
-A correção é um comando, sem reboot: `claude-account use <qualquer-perfil>`. Login nativo achado no
-slot vivo nunca é apagado: o `CLAUDE_CODE_OAUTH_TOKEN` vence, e sessões nativas rodando seguem
-renovando o próprio token. Rode `claude-account import-native <nome>` se quiser ele como perfil.
+A correção é um comando, sem reboot: `claude-account use <perfil-ativo>`. O `/login` achado no slot
+nunca é apagado: fica guardado como `Claude Code-credentials-last-login-archive`, e
+`claude-account import-native <nome> --last-login` o transforma em perfil. Testes de cenário
+offline da troca: `tests/switch-scenarios.sh`.
 
 ## Requisitos
 
