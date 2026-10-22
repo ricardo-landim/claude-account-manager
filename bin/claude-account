@@ -50,6 +50,27 @@ die() { printf 'claude-account: ERROR: %s\n' "$*" >&2; exit 1; }
 usage_error() { printf 'claude-account: ERROR: %s\n' "$*" >&2; exit 2; }
 note() { printf 'claude-account: %s\n' "$*"; }
 
+# One line in the Claude daemon log naming who stops sessions and why, so the next
+# "every session died" has a cause on record. The daemon itself only logs
+# "shutdown requested via control socket" or "settled <id> (killed)".
+DAEMON_LOG="${CLAUDE_DAEMON_LOG:-$HOME/.claude/daemon.log}"
+caller_chain() {
+  local pid=$PPID out="" i=0 cmd
+  while [ -n "$pid" ] && [ "$pid" -gt 1 ] && [ "$i" -lt 4 ]; do
+    cmd="$(ps -o command= -p "$pid" 2>/dev/null | cut -c1-80 || true)"
+    out="${out:+$out < }$pid:$cmd"
+    pid="$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ' || true)"
+    i=$((i + 1))
+  done
+  printf '%s' "$out"
+}
+log_stop_reason() {
+  [ -d "$(dirname "$DAEMON_LOG")" ] || return 0
+  printf '[%s] [claude-account] %s | tty=%s | by %s\n' \
+    "$(date -u +%Y-%m-%dT%H:%M:%S.000Z)" "$*" "$( { tty -s && tty; } 2>/dev/null || echo none)" "$(caller_chain)" \
+    >>"$DAEMON_LOG" 2>/dev/null || true
+}
+
 need() {
   command -v "$1" >/dev/null 2>&1 || die "missing command: $1"
 }
@@ -291,9 +312,11 @@ inside_background_agent() {
 # keeps them alive on the account they started with.
 restart_claude_daemon() {
   if [ "$1" = true ] || inside_background_agent; then
+    log_stop_reason "daemon stop --keep-workers: switch to profile '$(active_name 2>/dev/null || true)', agents kept"
     "$NATIVE_BIN" daemon stop --any --keep-workers >/dev/null 2>&1 || true
     note "daemon restarted; running agents keep their account until respawned (claude respawn)"
   else
+    log_stop_reason "daemon stop: switch to profile '$(active_name 2>/dev/null || true)', every agent ends"
     "$NATIVE_BIN" daemon stop --any >/dev/null 2>&1 || true
   fi
 }
@@ -655,6 +678,7 @@ cmd_bg_restart() {
   count="$(jq length <<<"$sessions")"
   if [ "$count" -eq 0 ]; then
     rm -f "$BG_PENDING_FILE"
+    log_stop_reason "daemon stop: bg-restart to profile '$active', 0 background sessions"
     "$NATIVE_BIN" daemon stop --any >/dev/null 2>&1 || true
     printf '%s\n' "$active" > "$DAEMON_PROFILE_FILE"
     note "bg-restart: 0 background sessions; daemon stopped, the next one starts under '$active'"
@@ -694,6 +718,7 @@ cmd_bg_restart_worker() {
     return 1
   fi
   sleep "$BG_SETTLE_S"
+  log_stop_reason "daemon stop: bg-restart moves $(jq length "$snapshot") session(s) to profile '$active', resumed with the same ids"
   "$NATIVE_BIN" daemon stop --any || true
   sleep "$BG_SETTLE_S"
   n="$(jq length "$snapshot")"
@@ -1078,6 +1103,9 @@ regime_effort_args() {
 cmd_exec() {
   apply_profile_env
   local extra; extra="$(regime_effort_args "$@")"
+  case "${1:-} ${2:-}" in
+    "stop "*|"rm "*|"kill "*|"daemon stop"|"daemon shutdown") log_stop_reason "claude $*" ;;
+  esac
   [ -n "$extra" ] && note "quota in a restrictive regime: this session opens with --effort medium (pass --effort to override)" >&2
   # shellcheck disable=SC2086
   exec "$NATIVE_BIN" $extra "$@"
