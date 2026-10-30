@@ -121,6 +121,7 @@ claude-account use pessoal
 | 🚦 | `regime [--json]` | uma palavra dizendo o que a cota permite agora |
 | ▶️ | `exec [args...]` | roda o binário nativo sob o perfil ativo (o que o wrapper faz) |
 |  | `login <nome>` | login completo de um perfil OAuth, feito uma vez, num item próprio do Keychain (conectores do claude.ai) |
+|  | `update [--apply [versão]]` | Claude Code: versão instalada, a mais nova e as sessões em background; `--apply` instala pelo instalador nativo, troca o `claude-stable` por rename atômico, espera o daemon adotar as sessões e depois as reinicia (mesmos ids) junto com o Orca já na versão nova, como na troca de conta; `--no-restart` deixa elas na versão antiga até ficarem ociosas |
 |  | `bg-restart [--force]` | move as sessões em background para o perfil ativo, mesmos ids (adia se alguma estiver ocupada) |
 |  | `bg-status` | perfil ativo contra o do daemon, sessões em background, troca pendente |
 

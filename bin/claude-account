@@ -1150,6 +1150,140 @@ cmd_measure() {
   done
 }
 
+# Updating Claude Code (native installer). Each version lives in versions/<v> and the
+# `claude` symlink points at one. The shell runs a signed copy at a fixed path,
+# claude-stable, so macOS keeps its permission grants across versions; the daemon of the
+# background sessions runs from that copy and, when its file changes, restarts itself and
+# adopts the running sessions (2.1.299 to 2.1.301 on 16/10: adopted=19 dead=0).
+INSTALL_ROOT="${CLAUDE_INSTALL_ROOT:-$HOME/.local}"
+UPDATE_REGISTRY="${CLAUDE_ACCOUNT_UPDATE_REGISTRY:-https://registry.npmjs.org/@anthropic-ai/claude-code/latest}"
+DAEMON_LOG="${CLAUDE_ACCOUNT_DAEMON_LOG:-$HOME/.claude/daemon.log}"
+
+installed_version() { # the version the claude symlink points at
+  local real
+  real="$(readlink "$INSTALL_ROOT/bin/claude" 2>/dev/null)" || return 1
+  case "$real" in */versions/*) basename "$real" ;; *) return 1 ;; esac
+}
+
+stable_version() {
+  [ -x "$INSTALL_ROOT/bin/claude-stable" ] || { echo none; return 0; }
+  basename "$(cat "$INSTALL_ROOT/share/claude/.stable-src" 2>/dev/null || echo unknown)"
+}
+
+latest_version() {
+  curl -fsS --max-time 15 "$UPDATE_REGISTRY" 2>/dev/null | jq -r '.version // empty' 2>/dev/null
+}
+
+# Never copy over claude-stable in place: rewriting the inode the daemon and the workers
+# run from gets them killed (Code Signature Invalid) on the next page-in. A signed copy
+# goes to a temp file and is renamed over it, so running processes keep the old inode.
+sync_stable() {
+  local real tmp
+  [ -e "$INSTALL_ROOT/bin/claude-stable" ] || return 0
+  real="$(readlink "$INSTALL_ROOT/bin/claude")"
+  tmp="$INSTALL_ROOT/bin/.claude-stable.tmp.$$"
+  cp -f "$real" "$tmp" || { rm -f "$tmp"; return 1; }
+  # An unsigned binary does not run on Apple silicon: the daemon would restart from it and
+  # die with every session, so the copy goes in only once its new signature verifies.
+  codesign --remove-signature "$tmp" 2>/dev/null || true
+  if ! codesign -f -s - "$tmp" 2>/dev/null || ! codesign --verify "$tmp" 2>/dev/null; then
+    rm -f "$tmp"; return 1
+  fi
+  mv -f "$tmp" "$INSTALL_ROOT/bin/claude-stable" || { rm -f "$tmp"; return 1; }
+  printf '%s' "$real" > "$INSTALL_ROOT/share/claude/.stable-src" || \
+    note "claude-stable was replaced, but its marker was not written; the shell copies it again on its next start"
+}
+
+# Waits for the daemon's restart after the upgrade and prints what it adopted. Called
+# only when sessions were running, so a restart that never reports its adoption is a
+# daemon that died on the new binary: exit 1, as when sessions died in the handover.
+wait_daemon_adoption() {
+  local from="$1" wait="${CLAUDE_ACCOUNT_UPDATE_WAIT:-90}" i=0 line size
+  while [ "$i" -lt "$wait" ]; do
+    size="$(wc -c < "$DAEMON_LOG" 2>/dev/null | tr -d ' ' || echo 0)"
+    [ "${size:-0}" -ge "$from" ] || from=0
+    line="$(tail -c +"$((from + 1))" "$DAEMON_LOG" 2>/dev/null | grep -E 'bg adopt: adopted=' | tail -1 || true)"
+    [ -n "$line" ] && break
+    sleep 1; i=$((i + 1))
+  done
+  if [ -z "$line" ]; then
+    printf 'daemon: no adoption of the sessions reported in %ss\nhelp: claude-sessions (stopped sessions resume there); claude daemon status\n' "$wait"
+    return 1
+  fi
+  line="${line#*bg adopt: }"
+  printf 'daemon: restarted, %s\n' "$line"
+  case "$line" in *dead=0*) return 0 ;; esac
+  printf 'help: claude-sessions (sessions that died show as stopped; resume them there)\n'
+  return 1
+}
+
+cmd_update() {
+  local apply=0 restart=true target="" installed stable latest real sessions n from
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --apply) apply=1 ;;
+      --no-restart) restart=false ;;
+      -*) usage_error "update: unknown option $1" ;;
+      *) [ -z "$target" ] || usage_error "update: one version at most"; target="$1" ;;
+    esac
+    shift
+  done
+  [ "$restart" = true ] || [ "$apply" -eq 1 ] || usage_error "update: --no-restart goes with --apply"
+  [ -z "$target" ] || [ "$apply" -eq 1 ] || usage_error "update: a version goes with --apply (claude-account update --apply $target)"
+  case "$target" in ''|[0-9]*.[0-9]*.[0-9]*) ;; *) usage_error "update: '$target' is not a version (like 2.1.310)" ;; esac
+  installed="$(installed_version)" || die "update: $INSTALL_ROOT/bin/claude is not the native installer's link; update it the way it was installed"
+  stable="$(stable_version)"
+  latest="$(latest_version || true)"
+  sessions="$(bg_sessions_json 2>/dev/null || echo '[]')"
+  n="$(jq length <<<"$sessions" 2>/dev/null || echo 0)"
+  if [ "$apply" -eq 0 ]; then
+    printf 'installed: %s\nstable: %s\nlatest: %s\nbackground_sessions: %s\n' \
+      "$installed" "$stable" "${latest:-unknown (registry did not answer)}" "$n"
+    if [ "$stable" != none ] && [ "$stable" != "$installed" ]; then
+      printf 'help: claude-account update --apply %s   (claude-stable is behind the installed version)\n' "$installed"
+    elif [ -n "$latest" ] && [ "$latest" != "$installed" ]; then
+      printf 'help: claude-account update --apply   (the daemon restarts itself and adopts the %s sessions)\n' "$n"
+    else
+      printf 'help: up to date\n'
+    fi
+    return 0
+  fi
+  [ -n "$target" ] || target="$latest"
+  [ -n "$target" ] || die "update: the registry did not answer; name the version: claude-account update --apply 2.1.310"
+  if [ "$target" = "$installed" ] && { [ "$stable" = none ] || [ "$stable" = "$installed" ]; }; then
+    printf 'installed: %s (unchanged)\n' "$installed"
+    return 0
+  fi
+  from="$(wc -c < "$DAEMON_LOG" 2>/dev/null | tr -d ' ' || echo 0)"
+  if [ "$target" != "$installed" ]; then
+    real="$(readlink "$INSTALL_ROOT/bin/claude")"
+    "$real" install "$target" </dev/null >/dev/null 2>&1 || die "update: 'claude install $target' failed; nothing else changed (still $installed)"
+    [ "$(installed_version)" = "$target" ] || die "update: the installer ran but claude points at $(installed_version || echo nothing), not $target"
+  fi
+  sync_stable || die "update: $target installed, but claude-stable could not be replaced (still $stable); the shell copies it on its next start"
+  printf 'installed: %s (was %s)\nstable: %s\n' "$target" "$installed" "$(stable_version)"
+  if [ "$n" -gt 0 ] && [ "$(stable_version)" != none ]; then
+    wait_daemon_adoption "${from:-0}" || return 1
+  else
+    printf 'daemon: no background sessions to adopt\n'
+  fi
+  update_restart "$restart"
+}
+
+# The adopted sessions keep running the binary they started with. Like a switch of
+# account, the update then restarts every one of them (same ids, a busy one comes back
+# with the wake prompt) and Orca, so all of it runs the new version now.
+update_restart() {
+  if [ "$1" != true ]; then
+    note "--no-restart: open sessions keep the old version until they restart or go idle"
+    return 0
+  fi
+  local rc=0
+  ( cmd_bg_restart --force ) || { rc=1; note "the background sessions were not restarted; now: claude-account bg-restart --force"; }
+  schedule_orca_restart
+  return "$rc"
+}
+
 usage() {
   cat <<'EOF'
 Usage:
@@ -1178,6 +1312,11 @@ Usage:
   claude-account measure [name...]                  rate-limit state per profile (headers, no secrets)
   claude-account exec [args...]                     run the native binary under the active profile
   claude-account regime [--json|livre|economia|auto] what the quota allows right now (see claude-account-regime --help)
+  claude-account update [--apply [version] [--no-restart]]
+                                                    Claude Code: installed, latest, sessions; --apply installs
+                                                    it, refreshes claude-stable, waits for the daemon to adopt
+                                                    the background sessions, then restarts them (same ids) and
+                                                    Orca on the new version, as a switch does
 
 Exit codes: 0 ok, 1 error, 2 usage error.
 Override the native binary path with CLAUDE_NATIVE_BIN=/path/to/claude.
@@ -1202,6 +1341,7 @@ case "$command_name" in
   login) cmd_login "$@" ;;
   bg-restart) cmd_bg_restart "$@" ;;
   bg-status) cmd_bg_status "$@" ;;
+  update) cmd_update "$@" ;;
   _bg-restart-worker) cmd_bg_restart_worker "$@" ;;
   regime) exec "$(dirname "$0")/claude-account-regime" "$@" ;;
   help|-h|--help) usage ;;
